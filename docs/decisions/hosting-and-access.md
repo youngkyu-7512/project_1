@@ -44,3 +44,4 @@ Vercel을 그대로 쓰기로 한 이유는 이미 이 저장소가 Vercel과 �
   - 함수의 요청/응답 본문은 요금제와 무관하게 **4.5MB**로 고정되어 있고, 초과 시 `413 FUNCTION_PAYLOAD_TOO_LARGE`가 발생합니다. 스트리밍 응답도 이 제한에 포함됩니다.
   - 함수 배포 번들은 압축 해제 기준 250MB(Node), Python 함수는 500MB까지 허용됩니다.
   - Edge 런타임은 응답을 25초 안에 시작해야 하고, 이후 최대 300초까지 스트리밍을 이어갈 수 있습니다.
+- `ffmpeg-static` 패키지는 `path.join(__dirname, ...)`으로 자신이 내려받은 바이너리 경로를 찾습니다. Next.js가 이 패키지를 기본값대로 서버 번들에 포함시키면 `__dirname`이 실제 경로가 아니라 `\ROOT\node_modules\ffmpeg-static` 같은 자리표시자로 치환됩니다. `yt-dlp`는 이 잘못된 경로를 받고도 즉시 실패하지 않고 `WARNING: ffmpeg-location ... does not exist! Continuing without ffmpeg`라는 경고만 남긴 뒤, 영상과 소리를 합치지 않은 채 `exit 0`으로 끝납니다. 그 결과 `--print after_move:filepath`가 가리키는 합쳐진 파일은 존재하지 않고, 분리된 `.f<id>.mp4`/`.f<id>.webm` 조각만 남습니다. `next.config.ts`의 `serverExternalPackages: ["ffmpeg-static"]`로 이 패키지를 번들링에서 제외해(순수 Node `require`로 남겨) 해결했습니다. 같은 문제가 다시 나타나면 이 항목부터 의심합니다.

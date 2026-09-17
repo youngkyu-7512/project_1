@@ -31,6 +31,24 @@ function resolveYtDlp(): string | null {
   return "yt-dlp";
 }
 
+/**
+ * ffmpeg-static's own binary download runs as a bun/npm install-time script,
+ * which turned out to depend on the install cache actually re-running that
+ * script (confirmed broken in production once via a stale Vercel build cache
+ * even with the package correctly listed in trustedDependencies — see
+ * docs/decisions/hosting-and-access.md). A committed Linux binary at
+ * bin/ffmpeg removes that dependency on install-time behavior entirely, the
+ * same way bin/yt-dlp does. Local Windows development keeps using
+ * ffmpeg-static's own downloaded ffmpeg.exe.
+ */
+function resolveFfmpeg(): string | null {
+  if (process.platform !== "win32") {
+    const bundled = path.join(process.cwd(), "bin", "ffmpeg");
+    if (existsSync(bundled)) return bundled;
+  }
+  return ffmpegStaticPath;
+}
+
 export interface ToolAvailability {
   ytDlp: string | null;
   ffmpeg: string | null;
@@ -39,11 +57,7 @@ export interface ToolAvailability {
 
 export function resolveTools(): ToolAvailability {
   const ytDlp = resolveYtDlp();
-  // ffmpeg-static resolves to a real binary matching whatever platform it
-  // was installed on (ffmpeg.exe here in local Windows dev, a static Linux
-  // binary once installed during Vercel's build), so no platform branching
-  // is needed for ffmpeg itself.
-  const ffmpeg = ffmpegStaticPath;
+  const ffmpeg = resolveFfmpeg();
   return {
     ytDlp,
     ffmpeg,

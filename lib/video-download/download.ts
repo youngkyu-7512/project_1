@@ -1,8 +1,12 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdir, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { resolveTools } from "./tools";
+import { uploadForDownload } from "./blob";
 import { classifyExtractionFailure } from "./errors";
+import { resolveTools } from "./tools";
 
 export interface DownloadParams {
   url: string;
@@ -10,12 +14,10 @@ export interface DownloadParams {
    * yt-dlp's own "+bestaudio" selector, confirmed working against a real id
    * in docs/decisions/video-extraction.md's evidence trail. */
   videoFormatId: string;
-  folder: string;
 }
 
 export type DownloadOutcome =
-  | { kind: "success"; filePath: string; fileName: string }
-  | { kind: "already_exists"; filePath: string; fileName: string }
+  | { kind: "success"; downloadUrl: string; fileName: string }
   | { kind: "missing_tools"; tool: "yt-dlp" | "ffmpeg"; message: string }
   | { kind: "failed"; reason: string };
 
@@ -26,21 +28,21 @@ const TOTAL_STAGES = 2;
 const PROGRESS_LINE = /^\[download\]\s+([\d.]+)%/;
 const STAGE_DONE_LINE = /^\[download\]\s+100%\s+of\s+\S+\s+in\s+/;
 
-/**
- * Runs yt-dlp to fetch and merge one quality option, reporting overall
- * progress (0-100 across both streams) via onProgress. Stage boundaries are
- * detected from yt-dlp's own per-stage completion line rather than a percent
- * threshold, so both a fast/tiny download (whose only stdout for a stage may
- * be that single completion line) and a normal gradual one report correctly.
- */
-export async function downloadVideo(
+interface YtDlpDownloadRun {
+  code: number | null;
+  stdoutLines: string[];
+  stderr: string;
+  sawAnyDownloadLine: boolean;
+  spawnError: NodeJS.ErrnoException | null;
+}
+
+function runYtDlpDownload(
+  ytDlp: string,
+  ffmpegDir: string,
+  workDir: string,
   params: DownloadParams,
   onProgress: (percent: number) => void,
-): Promise<DownloadOutcome> {
-  const { ytDlp, ffmpeg, ffmpegDir } = resolveTools();
-  if (!ytDlp) return { kind: "missing_tools", tool: "yt-dlp", message: "yt-dlp를 찾을 수 없습니다." };
-  if (!ffmpeg || !ffmpegDir) return { kind: "missing_tools", tool: "ffmpeg", message: "ffmpeg을 찾을 수 없습니다." };
-
+): Promise<YtDlpDownloadRun> {
   const args = [
     "--newline",
     "--progress",
@@ -57,7 +59,7 @@ export async function downloadVideo(
     "--format",
     `${params.videoFormatId}+bestaudio/best`,
     "--paths",
-    params.folder,
+    workDir,
     "--output",
     "%(title)s [%(id)s].%(ext)s",
     "--print",
@@ -74,11 +76,9 @@ export async function downloadVideo(
     let sawAnyDownloadLine = false;
     let stageIndex = 0;
     let spawnError: NodeJS.ErrnoException | null = null;
-    // See extract.ts: a raw chunk boundary can split a multi-byte UTF-8
-    // character in a non-ASCII title/filename; StringDecoder holds back an
-    // incomplete trailing sequence instead of corrupting it into U+FFFD.
-    // This matters here more than most places: the file's real on-disk name
-    // is read back through this same stdout ("--print after_move:filepath").
+    // A raw Buffer chunk can split a multi-byte UTF-8 character across two
+    // "data" events; StringDecoder holds back an incomplete trailing
+    // sequence instead of corrupting it into U+FFFD.
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
 
@@ -116,37 +116,68 @@ export async function downloadVideo(
       stdoutBuf += stdoutDecoder.end();
       stderr += stderrDecoder.end();
       if (stdoutBuf.trim()) stdoutLines.push(stdoutBuf.trim());
-
-      if (spawnError) {
-        const isMissing = spawnError.code === "ENOENT";
-        resolve(
-          isMissing
-            ? { kind: "missing_tools", tool: "yt-dlp", message: spawnError.message }
-            : { kind: "failed", reason: spawnError.message },
-        );
-        return;
-      }
-
-      if (code !== 0) {
-        const failure = classifyExtractionFailure(stderr);
-        if (failure.kind === "missing_tools" && failure.tool) {
-          resolve({ kind: "missing_tools", tool: failure.tool, message: failure.message });
-        } else {
-          resolve({ kind: "failed", reason: failure.message });
-        }
-        return;
-      }
-
-      const filePath = [...stdoutLines].reverse().find((line) => line.trim().length > 0)?.trim();
-      if (!filePath) {
-        resolve({ kind: "failed", reason: "저장된 파일 경로를 확인하지 못했습니다." });
-        return;
-      }
-
-      const fileName = path.basename(filePath);
-      resolve(
-        sawAnyDownloadLine ? { kind: "success", filePath, fileName } : { kind: "already_exists", filePath, fileName },
-      );
+      resolve({ code, stdoutLines, stderr, sawAnyDownloadLine, spawnError });
     });
   });
+}
+
+/**
+ * Fetches and merges one quality option, then uploads the result to Vercel
+ * Blob and returns its download URL (docs/decisions/hosting-and-access.md:
+ * the function's own response is capped at 4.5MB, far below a real video, so
+ * the file itself never travels through this function's response).
+ */
+export async function downloadVideo(
+  params: DownloadParams,
+  onProgress: (percent: number) => void,
+): Promise<DownloadOutcome> {
+  const { ytDlp, ffmpeg, ffmpegDir } = resolveTools();
+  if (!ytDlp) return { kind: "missing_tools", tool: "yt-dlp", message: "yt-dlp를 찾을 수 없습니다." };
+  if (!ffmpeg || !ffmpegDir) return { kind: "missing_tools", tool: "ffmpeg", message: "ffmpeg을 찾을 수 없습니다." };
+
+  const workDir = path.join(os.tmpdir(), `vdl-${randomUUID()}`);
+  await mkdir(workDir, { recursive: true });
+
+  try {
+    const { code, stdoutLines, stderr, sawAnyDownloadLine, spawnError } = await runYtDlpDownload(
+      ytDlp,
+      ffmpegDir,
+      workDir,
+      params,
+      onProgress,
+    );
+
+    if (spawnError) {
+      const isMissing = spawnError.code === "ENOENT";
+      return isMissing
+        ? { kind: "missing_tools", tool: "yt-dlp", message: spawnError.message }
+        : { kind: "failed", reason: spawnError.message };
+    }
+
+    if (code !== 0) {
+      const failure = classifyExtractionFailure(stderr);
+      return failure.kind === "missing_tools" && failure.tool
+        ? { kind: "missing_tools", tool: failure.tool, message: failure.message }
+        : { kind: "failed", reason: failure.message };
+    }
+
+    if (!sawAnyDownloadLine) {
+      return { kind: "failed", reason: "다운로드가 시작되지 않았습니다." };
+    }
+
+    const filePath = [...stdoutLines].reverse().find((line) => line.trim().length > 0)?.trim();
+    if (!filePath) {
+      return { kind: "failed", reason: "저장된 파일 경로를 확인하지 못했습니다." };
+    }
+
+    const fileName = path.basename(filePath);
+    try {
+      const { downloadUrl } = await uploadForDownload(filePath, fileName);
+      return { kind: "success", downloadUrl, fileName };
+    } catch (err) {
+      return { kind: "failed", reason: err instanceof Error ? err.message : "파일을 전달하지 못했습니다." };
+    }
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
 }

@@ -52,6 +52,7 @@
   ],
   "trustedDependencies": [
     "sharp",
-    "unrs-resolver"
+    "unrs-resolver",
+    "ffmpeg-static"
   ]
 }
